@@ -1,0 +1,728 @@
+use POSIX qw(strftime);
+
+##
+## Функции
+##
+sub _dechunk
+{
+  my $chunks = shift;
+  my $item   = shift(@{$chunks});
+
+  # Словари
+  if( $item eq 'd' ) {
+    $item = shift(@{$chunks});
+    my %hash;
+
+    while( $item ne 'e' ) {
+      unshift(@{$chunks}, $item);
+      my $key = _dechunk($chunks);
+      $hash{$key} = _dechunk($chunks);
+      $item = shift(@{$chunks});
+    }
+
+    return \%hash;
+  }
+
+  # Списки
+  if( $item eq 'l' ) {
+    $item = shift(@{$chunks});
+    my @list;
+
+    while( $item ne 'e' ) {
+      unshift(@{$chunks}, $item);
+      push(@list, _dechunk($chunks));
+      $item = shift(@{$chunks});
+    }
+
+    return \@list;
+  }
+
+  # Числа
+  if( $item eq 'i' ) {
+    my $num;
+    $item = shift(@{$chunks});
+
+    while( $item ne 'e' ) {
+      $num .= $item;
+      $item = shift(@{$chunks});
+    }
+
+    return $num;
+  }
+
+  # Строки
+  if( $item =~ /\d/ ) {
+    my $num;
+
+    while( $item =~ /\d/ ) {
+      $num .= $item;
+      $item = shift(@{$chunks});
+    }
+
+    my $line = '';
+
+    for( 1 .. $num ) {
+      $line .= shift(@{$chunks});
+    }
+
+    return $line;
+  }
+
+  return $chunks;
+}
+
+sub bencode
+{
+  no locale;
+  my $s    = shift;
+  my $line = '';
+
+  # Словари
+  if( ref($s) eq 'HASH' ) {
+    $line = 'd';
+
+    foreach my $key (sort(keys %{$s})) {
+      $line .= bencode($key);
+      $line .= bencode(${$s}{$key});
+    }
+
+    $line .= 'e';
+    return $line;
+  }
+
+  # Списки
+  if( ref($s) eq 'ARRAY' ) {
+    $line = 'l';
+
+    foreach my $l (@{$s}) {
+      $line .= bencode($l);
+    }
+
+    $line .= 'e';
+    return $line;
+  }
+
+  # Числа
+  if( $s =~ /^\d+$/ ) {
+    return sprintf('i%de', $s);
+  }
+
+  # Строки
+  return sprintf('%d:%s', length($s), $s);
+}
+
+sub bdecode
+{
+  my $s      = shift;
+  my @chunks = split(//, $s);
+  my $root   = _dechunk(\@chunks);
+  return $root;
+}
+###############################################################################
+
+#
+# Сообщение трекера
+#
+sub btt_msg
+{
+  my($session, $msg) = @_;
+
+  print $session "HTTP/1.1 200 OK\r\nDate: " . strftime('%a, %e %b %Y %H:%M:%S GMT', gmtime) . "\r\nServer: bt.ivacuum.ru/1.0\r\nConnection: close\r\nContent-type: text/plain\r\n\r\n" . bencode($msg);
+
+  return &close_connection($session);
+}
+
+#
+# Ошибка трекера
+#
+sub btt_msg_die
+{
+  my($session, $msg) = @_;
+
+  if( $event eq 'stopped' ) {
+    return;
+  }
+
+  print $session "HTTP/1.1 200 OK\r\nDate: " . strftime('%a, %e %b %Y %H:%M:%S GMT', gmtime) . "\r\nServer: bt.ivacuum.ru/1.0\r\nConnection: close\r\nContent-type: text/plain\r\n\r\n" . bencode({
+    'min interval'   => $g_announce_interval,
+    'failure reason' => $msg,
+    'warning reason' => $msg
+  });
+
+  return &close_connection($session);
+}
+
+#
+# Завершение сеанса связи с клиентом
+#
+sub close_connection
+{
+  my($session) = @_;
+
+  $session->flush();
+  shutdown $session, 2;
+
+  return 0;
+}
+
+#
+# Запись информации о состоянии закачек
+#
+sub cron_dlstatus_write
+{
+  my $sql = '
+      INSERT INTO
+          bb_bt_dlstatus_main
+      (topic_id, user_id, user_status) VALUES ' . $g_dlstatus_buffer . '
+      ON DUPLICATE KEY UPDATE
+          user_status = values(user_status)';
+  &sql_do($sql) if($g_dlstatus_buffer);
+
+  $g_dlstatus_buffer = '';
+}
+
+#
+# Дозагрузка новых торрентов
+#
+sub cron_files_read
+{
+  &db_ping();
+
+  my $sql = '
+      SELECT
+          info_hash,
+          poster_id,
+          topic_id,
+          complete_count,
+          speed_down,
+          speed_up,
+          reg_time,
+          seeder_last_seen,
+          last_dl_time
+      FROM
+          bb_bt_torrents
+      WHERE
+          reg_time >= ?';
+  my $result = $db->prepare($sql);
+  $result->execute($g_timers{'files_read'});
+
+  while( my $row = $result->fetchrow_hashref ) {
+    $g_files{$row->{'info_hash'}} = {
+      'complete_count'   => int($row->{'complete_count'}),
+      'dirty'            => 0,
+      'last_dl_time'     => int($row->{'last_dl_time'}),
+      'leechers'         => 0,
+      'peers'            => {},
+      'poster_id'        => int($row->{'poster_id'}),
+      'reg_time'         => int($row->{'reg_time'}),
+      'seeder_last_seen' => int($row->{'seeder_last_seen'}),
+      'seeders'          => 0,
+      'speed_down'       => int($row->{'speed_down'}),
+      'speed_up'         => int($row->{'speed_up'}),
+      'topic_id'         => int($row->{'topic_id'})
+    };
+  }
+
+  $g_timers{'files_read'} = $ev_unixtime;
+}
+
+#
+# Запись информации о торрент-файлах в БД
+#
+sub cron_files_write
+{
+  my $sql_buffer = '';
+
+  foreach my $key (keys %g_files) {
+    next if(!$g_files{$key}{'dirty'});
+
+    $sql_buffer = sprintf('%s%s(%d, %d, %d, %d, %d, %d, %d, %d)', $sql_buffer, (($sql_buffer) ? ', ' : ''), $g_files{$key}{'topic_id'}, $g_files{$key}{'complete_count'}, $g_files{$key}{'speed_down'}, $g_files{$key}{'speed_up'}, $g_files{$key}{'seeder_last_seen'}, $g_files{$key}{'last_dl_time'}, $g_files{$key}{'seeders'}, $g_files{$key}{'leechers'});
+
+    $g_files{$key}{'dirty'} = 0;
+  }
+
+  my $sql = '
+      INSERT INTO
+          bb_bt_torrents
+      (topic_id, complete_count, speed_down, speed_up, seeder_last_seen, last_dl_time, seeders, leechers) VALUES ' . $sql_buffer . '
+      ON DUPLICATE KEY UPDATE
+          complete_count = values(complete_count),
+          speed_down = values(speed_down),
+          speed_up = values(speed_up),
+          seeder_last_seen = values(seeder_last_seen),
+          last_dl_time = values(last_dl_time),
+          seeders = values(seeders),
+          leechers = values(leechers)';
+  &sql_do($sql) if($sql_buffer);
+}
+
+#
+# Удаление информации об отключившихся пирах
+#
+sub cron_peers_purge
+{
+  my %g_uids;
+  my $peers_deleted = 0;
+
+  foreach my $key (keys %g_users) {
+    $g_uids{$g_users{$key}{'user_id'}} = $key;
+  }
+
+  foreach my $info_hash (keys %g_files) {
+    foreach my $peer_hash (keys %{$g_files{$info_hash}{'peers'}}) {
+      next if($ev_unixtime - $g_peers{$peer_hash}{'mtime'} <= $g_expiration_time);
+
+      my $auth_key = $g_uids{$g_peers{$peer_hash}{'user_id'}};
+
+      if( $g_peers{$peer_hash}{'seeder'} ) {
+        $g_files{$info_hash}{'seeders'}--;
+        $g_users{$auth_key}{'seeding'}--;
+      } else {
+        $g_files{$info_hash}{'leechers'}--;
+        $g_users{$auth_key}{'leeching'}--;
+      }
+
+      $g_files{$info_hash}{'dirty'} = 1;
+      $g_files{$info_hash}{'speed_down'} -= $g_peers{$peer_hash}{'speed_down'};
+      $g_files{$info_hash}{'speed_up'} -= $g_peers{$peer_hash}{'speed_up'};
+      $g_users{$auth_key}{'dirty'} = 1;
+      $g_users{$auth_key}{'speed_down'} -= $g_peers{$peer_hash}{'speed_down'};
+      $g_users{$auth_key}{'speed_up'} -= $g_peers{$peer_hash}{'speed_up'};
+      delete $g_peers{$peer_hash};
+      delete $g_files{$info_hash}{'peers'}{$peer_hash};
+
+      $peers_deleted++;
+    }
+  }
+
+  &db_ping();
+
+  my $sql = 'DELETE FROM bb_bt_tracker WHERE update_time <= ?';
+  my $rows = $db->do($sql, undef, $ev_unixtime - $g_expiration_time);
+}
+
+#
+# Синхронизация количества сидов и личей на раздачах и
+# и количества раздаваемых и скачиваемых торрентов пользователями
+#
+sub cron_peers_sync
+{
+  my %g_uids;
+
+  foreach my $auth_key (keys %g_users) {
+    $g_users{$auth_key}{'leeching'} = $g_users{$auth_key}{'seeding'} = 0;
+    $g_users{$auth_key}{'speed_down'} = $g_users{$auth_key}{'speed_up'} = 0;
+    $g_uids{$g_users{$auth_key}{'user_id'}} = $auth_key;
+  }
+
+  foreach my $info_hash (keys %g_files) {
+    $g_files{$info_hash}{'leechers'} = $g_files{$info_hash}{'seeders'} = 0;
+
+    foreach my $peer_hash (keys %{$g_files{$info_hash}{'peers'}}) {
+      my $auth_key = $g_uids{$g_peers{$peer_hash}{'user_id'}};
+
+      if( $g_peers{$peer_hash}{'seeder'} ) {
+        $g_files{$info_hash}{'seeders'}++;
+        $g_users{$auth_key}{'seeding'}++;
+      } else {
+        $g_files{$info_hash}{'leechers'}++;
+        $g_users{$auth_key}{'leeching'}++;
+      }
+
+      $g_files{$info_hash}{'dirty'} = 1;
+      $g_users{$auth_key}{'dirty'} = 1;
+      $g_users{$auth_key}{'speed_down'} += $g_peers{$peer_hash}{'speed_down'};
+      $g_users{$auth_key}{'speed_up'} += $g_peers{$peer_hash}{'speed_up'};
+    }
+  }
+}
+
+#
+# Удаленные торрент-файлы
+#
+sub cron_torrents_deleted
+{
+  my %g_uids;
+  my $peers_deleted = 0;
+
+  foreach my $key (keys %g_users) {
+    $g_uids{$g_users{$key}{'user_id'}} = $key;
+  }
+
+  my $sql = '
+      SELECT
+          *
+      FROM
+          bb_bt_torrents_del';
+  my $result = &sql_query($sql);
+
+  $sql = 'DELETE FROM bb_bt_torrents_del WHERE info_hash = ?';
+  my $delete = $db->prepare($sql);
+
+  $sql = 'DELETE FROM bb_bt_tracker WHERE topic_id = ?';
+  my $delete_peers = $db->prepare($sql);
+
+  while( my $row = $result->fetchrow_hashref ) {
+    my $info_hash = $row->{'info_hash'};
+
+    $delete->execute($info_hash);
+
+    if( int($row->{'is_del'}) and defined $g_files{$info_hash} ) {
+      foreach my $peer_hash (keys %{$g_files{$info_hash}{'peers'}}) {
+        my $auth_key = $g_uids{$g_peers{$peer_hash}{'user_id'}};
+
+        if( $g_peers{$peer_hash}{'seeder'} ) {
+          $g_files{$info_hash}{'seeders'}--;
+          $g_users{$auth_key}{'seeding'}--;
+        } else {
+          $g_files{$info_hash}{'leechers'}--;
+          $g_users{$auth_key}{'leeching'}--;
+        }
+
+        $g_users{$auth_key}{'dirty'} = 1;
+        $g_users{$auth_key}{'speed_down'} -= $g_peers{$peer_hash}{'speed_down'};
+        $g_users{$auth_key}{'speed_up'} -= $g_peers{$peer_hash}{'speed_up'};
+        delete $g_peers{$peer_hash};
+        # Можно удалить после отладки
+        delete $g_files{$info_hash}{'peers'}{$peer_hash};
+
+        $peers_deleted++;
+      }
+
+      $delete_peers->execute($row->{'topic_id'});
+      delete $g_files{$info_hash};
+    }
+  }
+}
+
+#
+# Дозагрузка новых пользователей
+# TODO: limit
+#
+sub cron_users_read
+{
+  &db_ping();
+
+  my $sql = '
+      SELECT
+          user_id,
+          auth_key,
+          user_agent,
+          can_leech
+      FROM
+          bb_bt_users
+      WHERE
+          key_regtime >= ?';
+  my $result = $db->prepare($sql);
+  $result->execute($g_timers{'users_read'});
+
+  while( my $row = $result->fetchrow_hashref ) {
+    if( defined($g_users{$row->{'auth_key'}}) ) {
+      $g_users{$row->{'auth_key'}}{'can_leech'} = int($row->{'can_leech'});
+    } else {
+      $g_users{$row->{'auth_key'}} = {
+        'bonus'      => 0,
+        'can_leech'  => int($row->{'can_leech'}),
+        'dirty'      => 0,
+        'downloaded' => 0,
+        'leeching'   => 0,
+        'limit'      => $g_max_leeching,
+        'released'   => 0,
+        'seeding'    => 0,
+        'speed_down' => 0,
+        'speed_up'   => 0,
+        'timebonus'  => 0,
+        'uploaded'   => 0,
+        'user_agent' => $row->{'user_agent'},
+        'user_id'    => int($row->{'user_id'})
+      };
+    }
+  }
+
+  $g_timers{'users_read'} = $ev_unixtime;
+}
+
+#
+# Запись информации о пользователях в БД
+#
+sub cron_users_write
+{
+  my $sql = '
+      INSERT INTO
+          bb_bt_tracker
+      (peer_hash, topic_id, user_id, ip, port, seeder, releaser, uploaded, downloaded, remain, speed_up, speed_down, user_agent, seeding, connect_time, update_time) VALUES ' . $g_peers_buffer . '
+      ON DUPLICATE KEY UPDATE
+          seeder = values(seeder),
+          releaser = values(releaser),
+          uploaded = values(uploaded),
+          downloaded = values(downloaded),
+          remain = values(remain),
+          speed_up = values(speed_up),
+          speed_down = values(speed_down),
+          user_agent = values(user_agent),
+          seeding = values(seeding),
+          connect_time = values(connect_time),
+          update_time = values(update_time)';
+  &sql_do($sql) if($g_peers_buffer);
+
+  $g_peers_buffer = '';
+  my $sql_buffer = '';
+
+  foreach my $key (keys %g_users) {
+    next if(!$g_users{$key}{'dirty'});
+
+    $sql_buffer = sprintf('%s%s(%d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, "%s", %d)', $sql_buffer, (($sql_buffer) ? ', ' : ''), $g_users{$key}{'user_id'}, $g_users{$key}{'uploaded'}, $g_users{$key}{'uploaded'}, $g_users{$key}{'downloaded'}, $g_users{$key}{'downloaded'}, $g_users{$key}{'released'}, $g_users{$key}{'released'}, $g_users{$key}{'bonus'}, $g_users{$key}{'bonus'}, $g_users{$key}{'timebonus'}, $g_users{$key}{'speed_down'}, $g_users{$key}{'speed_up'}, $g_users{$key}{'speed_down'}, $g_users{$key}{'speed_up'}, $g_users{$key}{'seeding'}, $g_users{$key}{'leeching'}, $g_users{$key}{'user_agent'}, $g_users{$key}{'can_leech'});
+
+    # Обнуляем занесенные в базу значения
+    $g_users{$key}{'bonus'} = 0;
+    $g_users{$key}{'dirty'} = 0;
+    $g_users{$key}{'downloaded'} = 0;
+    $g_users{$key}{'released'} = 0;
+    $g_users{$key}{'timebonus'} = 0;
+    $g_users{$key}{'uploaded'} = 0;
+  }
+
+  $sql = '
+      INSERT INTO
+          bb_bt_users
+      (user_id, u_up_total, u_up_today, u_down_total, u_down_today, u_up_release, u_up_release_today, u_up_bonus, u_up_bonus_today, timebonus_today, speed_down, speed_up, max_speed_down, max_speed_up, seeding, leeching, user_agent, can_leech) VALUES ' . $sql_buffer . '
+      ON DUPLICATE KEY UPDATE
+          u_up_total = u_up_total + values(u_up_total),
+          u_up_today = u_up_today + values(u_up_total),
+          u_down_total = u_down_total + values(u_down_total),
+          u_down_today = u_down_today + values(u_down_total),
+          u_up_release = u_up_release + values(u_up_release),
+          u_up_release_today = u_up_release_today + values(u_up_release),
+          u_up_bonus = u_up_bonus + values(u_up_bonus),
+          u_up_bonus_today = u_up_bonus_today + values(u_up_bonus),
+          timebonus_today = timebonus_today + values(timebonus_today),
+          speed_down = values(speed_down),
+          speed_up = values(speed_up),
+          max_speed_down = GREATEST(max_speed_down, values(max_speed_down)),
+          max_speed_up = GREATEST(max_speed_up, values(max_speed_up)),
+          seeding = values(seeding),
+          leeching = values(leeching),
+          user_agent = values(user_agent),
+          can_leech = values(can_leech)';
+  &sql_do($sql) if($sql_buffer);
+}
+
+#
+# Продолжительность
+#
+sub date_format
+{
+  my $timestamp = shift;
+  return sprintf('%d дн. %02d:%02d:%02d', $timestamp / 86400, $timestamp / 3600 % 24, $timestamp / 60 % 60, $timestamp % 60);
+}
+
+#
+# Подключение к БД
+#
+sub db_connect
+{
+  $db = DBI->connect('DBI:mysql:database=' . $db_name . ';mysql_socket=' . $db_host, $db_user, $db_pass);
+
+  while( !$db ) {
+    &print_event('CORE', "\nНевозможно подключиться к БД MySQL '$db_name', расположенной на '$db_host'\nОписание ошибки: $DBI::errstr");
+    sleep(5);
+    $db = DBI->connect('DBI:mysql:database=' . $db_name . ';mysql_socket=' . $db_host, $db_user, $db_pass);
+  }
+
+  &print_event('CORE', 'Успешное подключение к БД');
+}
+
+#
+# Проверка связи с БД
+#
+sub db_ping
+{
+  if( !$db->ping() ) {
+    &print_event('CORE', 'Утеряна связь с сервером. Переподключение...');
+    &db_connect();
+  }
+}
+
+#
+# Удаление пира
+#
+sub delete_peer
+{
+  my($info_hash, $peer_hash, $auth_key) = @_;
+
+  &db_ping();
+
+  # Удаление пира из БД
+  my $sql = 'DELETE FROM bb_bt_tracker WHERE peer_hash = ?';
+  my $result = $db->prepare($sql);
+  $result->execute($peer_hash);
+
+  if( defined $g_files{$info_hash}{'peers'}{$peer_hash} ) {
+    delete $g_files{$info_hash}{'peers'}{$peer_hash};
+
+    if( $g_peers{$peer_hash}{'seeder'} ) {
+      $g_files{$info_hash}{'seeders'}--;
+      $g_users{$auth_key}{'seeding'}--;
+    } else {
+      $g_files{$info_hash}{'leechers'}--;
+      $g_users{$auth_key}{'leeching'}--;
+    }
+
+    $g_users{$auth_key}{'dirty'} = 1;
+  }
+
+  if( defined $g_peers{$peer_hash} ) {
+    delete $g_peers{$peer_hash};
+  }
+}
+
+#
+# Текущая метка времени
+#
+sub get_timestamp
+{
+  my($format) = @_;
+  my($sec, $min, $hour, $mday, $mon, $year) = localtime(EV::now);
+
+  $format = '%04d-%02d-%02d %02d:%02d:%02d' unless($format);
+
+  return sprintf($format, $year + 1900, $mon + 1, $mday, $hour, $min, $sec);
+}
+
+#
+# converts an IP address x.x.x.x into a long IP number as used by ulog
+#
+sub ip2long
+{
+  my $ip_address = shift;
+
+  my(@octets, $octet, $ip_number, $number_convert);
+
+  chomp($ip_address);
+  @octets = split(/\./, $ip_address);
+  $ip_number = 0;
+
+  foreach $octet (@octets) {
+    $ip_number <<= 8;
+    $ip_number |= $octet;
+  }
+
+  return $ip_number;
+}
+
+#
+# Сообщение трекера
+#
+sub html_msg
+{
+  my($session, $title, $msg) = @_;
+
+  print $session "HTTP/1.1 200 OK\r\nDate: " . strftime('%a, %e %b %Y %H:%M:%S GMT', gmtime) . "\r\nServer: bt.ivacuum.ru/1.0\r\nConnection: close\r\nContent-type: text/html; charset=utf-8\r\nCache-Control: no-cache, pre-check=0, post-check=0\r\nExpires: Fri, 1 Jan 2010 00:00:00 GMT\r\nPragma: no-cache\r\n\r\n".'<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>' . $title . '</title><link rel="shortcut icon" href="//ivacuum.org/i/_/server_network.png"><link rel="stylesheet" href="//ivacuum.org/i/bootstrap/2.0.0/style.css"><link rel="stylesheet" href="//ivacuum.org/i/bootstrap/2.0.0/expansion.css"></head><body><div class="navbar navbar-fixed-top"><div class="navbar-inner"><div class="container"><a class="brand" href="/stats">btt.ivacuum.ru</a></div></div></div><div class="container">' . $msg . '</div></body></html>';
+
+  return &close_connection($session);
+}
+
+sub html_msg_simple
+{
+  my($session, $msg) = @_;
+
+  print $session "HTTP/1.1 200 OK\r\nDate: " . strftime('%a, %e %b %Y %H:%M:%S GMT', gmtime) . "\r\nServer: bt.ivacuum.ru/1.0\r\nConnection: close\r\nContent-type: text/html; charset=utf-8\r\nCache-Control: no-cache, pre-check=0, post-check=0\r\nExpires: Fri, 1 Jan 2010 00:00:00 GMT\r\nPragma: no-cache\r\n\r\n" . $msg;
+
+  return &close_connection($session);
+}
+
+#
+# Форматирование числа
+#
+sub num_format
+{
+  local $_ = shift;
+  1 while s/^(-?\d+)(\d{3})/$1 $2/;
+  return $_;
+}
+
+#
+# Выделение из строки пар ключ=значение
+#
+sub parse_qs
+{
+  my $s     = shift;
+  my @pairs = split(/&/, $s);
+  my %hash;
+
+  foreach my $pair (@pairs) {
+    next unless $pair;
+    my($key, $value) = split(/=/, $pair);
+    $hash{$key} = $value;
+  }
+
+  return %hash;
+}
+
+#
+# Выводит информацию о событии (при $g_debug > 0)
+#
+sub print_event
+{
+  my($code, $text) = @_;
+
+  printf("%s: %s: %s\n", &get_timestamp(), $code, $text) if($g_debug > 1 or $code eq 'CORE');
+}
+
+#
+# Кэширование и выполнение sql запроса и возврат идентификатора
+#
+sub sql_query
+{
+  my($sql) = @_;
+
+  if( !$db->ping() ) {
+    &print_event('CORE', 'Утеряна связь с сервером. Переподключение...');
+    &db_connect();
+  }
+
+  my $result = $db->prepare($sql) or die("Невозможно подготовить запрос:\n$sql\n$DBI::errstr");
+  $result->execute() or die("Невозможно выполнить запрос:\n$sql\n$DBI::errstr");
+
+  return $result;
+}
+
+#
+# Выполнение sql запроса и возврат идентификатора
+#
+sub sql_do
+{
+  my($sql) = @_;
+
+  if( !$db->ping() ) {
+    &print_event('CORE', 'Утеряна связь с сервером. Переподключение...');
+    &db_connect();
+  }
+
+  $db->do($sql);
+}
+
+#
+# Завершение работы трекера
+#
+sub tracker_shutdown
+{
+  my($signal) = @_;
+
+  print "\n";
+  &print_event('CORE', 'Получен сигнал: ' . $signal);
+  EV::break;
+
+  if( !($0 =~ /_dev/) ) {
+    &cron_dlstatus_write();
+    &cron_torrents_deleted();
+    &cron_files_write();
+    &cron_users_write();
+    &print_event('CORE', 'Задачи по расписанию выполнены');
+  }
+
+  $db->disconnect;
+  &print_event('CORE', 'Успешное завершение сеанса связи с БД');
+  &print_event('CORE', 'Завершение работы трекера...');
+  exit(0);
+}
