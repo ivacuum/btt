@@ -139,9 +139,7 @@ sub btt_msg_die
 {
   my($session, $msg) = @_;
 
-  if( $event eq 'stopped' ) {
-    return;
-  }
+  return if $event eq 'stopped';
 
   print $session "HTTP/1.1 200 OK\r\nDate: " . strftime('%a, %e %b %Y %H:%M:%S GMT', gmtime) . "\r\nServer: bt.ivacuum.ru/1.0\r\nConnection: close\r\nContent-type: text/plain\r\n\r\n" . bencode({
     'min interval'   => $g_announce_interval,
@@ -176,7 +174,7 @@ sub cron_dlstatus_write
       (topic_id, user_id, user_status) VALUES ' . $g_dlstatus_buffer . '
       ON DUPLICATE KEY UPDATE
           user_status = values(user_status)';
-  &sql_do($sql) if($g_dlstatus_buffer);
+  &sql_do($sql) if $g_dlstatus_buffer;
 
   $g_dlstatus_buffer = '';
 }
@@ -234,7 +232,7 @@ sub cron_files_write
   my $sql_buffer = '';
 
   foreach my $key (keys %g_files) {
-    next if(!$g_files{$key}{'dirty'});
+    next if !$g_files{$key}{'dirty'};
 
     $sql_buffer = sprintf('%s%s(%d, %d, %d, %d, %d, %d, %d, %d)', $sql_buffer, (($sql_buffer) ? ', ' : ''), $g_files{$key}{'topic_id'}, $g_files{$key}{'complete_count'}, $g_files{$key}{'speed_down'}, $g_files{$key}{'speed_up'}, $g_files{$key}{'seeder_last_seen'}, $g_files{$key}{'last_dl_time'}, $g_files{$key}{'seeders'}, $g_files{$key}{'leechers'});
 
@@ -253,7 +251,7 @@ sub cron_files_write
           last_dl_time = values(last_dl_time),
           seeders = values(seeders),
           leechers = values(leechers)';
-  &sql_do($sql) if($sql_buffer);
+  &sql_do($sql) if $sql_buffer;
 }
 
 #
@@ -270,7 +268,7 @@ sub cron_peers_purge
 
   foreach my $info_hash (keys %g_files) {
     foreach my $peer_hash (keys %{$g_files{$info_hash}{'peers'}}) {
-      next if($ev_unixtime - $g_peers{$peer_hash}{'mtime'} <= $g_expiration_time);
+      next if $ev_unixtime - $g_peers{$peer_hash}{'mtime'} <= $g_expiration_time;
 
       my $auth_key = $g_uids{$g_peers{$peer_hash}{'user_id'}};
 
@@ -469,7 +467,7 @@ sub cron_users_write
   my $sql_buffer = '';
 
   foreach my $key (keys %g_users) {
-    next if(!$g_users{$key}{'dirty'});
+    next if !$g_users{$key}{'dirty'};
 
     $sql_buffer = sprintf('%s%s(%d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, "%s", %d)', $sql_buffer, (($sql_buffer) ? ', ' : ''), $g_users{$key}{'user_id'}, $g_users{$key}{'uploaded'}, $g_users{$key}{'uploaded'}, $g_users{$key}{'downloaded'}, $g_users{$key}{'downloaded'}, $g_users{$key}{'released'}, $g_users{$key}{'released'}, $g_users{$key}{'bonus'}, $g_users{$key}{'bonus'}, $g_users{$key}{'timebonus'}, $g_users{$key}{'speed_down'}, $g_users{$key}{'speed_up'}, $g_users{$key}{'speed_down'}, $g_users{$key}{'speed_up'}, $g_users{$key}{'seeding'}, $g_users{$key}{'leeching'}, $g_users{$key}{'user_agent'}, $g_users{$key}{'can_leech'});
 
@@ -571,9 +569,7 @@ sub delete_peer
     $g_users{$auth_key}{'dirty'} = 1;
   }
 
-  if( defined $g_peers{$peer_hash} ) {
-    delete $g_peers{$peer_hash};
-  }
+  delete $g_peers{$peer_hash} if defined $g_peers{$peer_hash};
 }
 
 #
@@ -647,12 +643,12 @@ sub num_format
 sub parse_qs
 {
   my $s     = shift;
-  my @pairs = split(/&/, $s);
+  my @pairs = split /&/, $s;
   my %hash;
 
   foreach my $pair (@pairs) {
     next unless $pair;
-    my($key, $value) = split(/=/, $pair);
+    my($key, $value) = split /=/, $pair;
     $hash{$key} = $value;
   }
 
@@ -666,7 +662,7 @@ sub print_event
 {
   my($code, $text) = @_;
 
-  printf("%s: %s: %s\n", &get_timestamp(), $code, $text) if($g_debug > 1 or $code eq 'CORE');
+  printf("%s: %s: %s\n", &get_timestamp(), $code, $text) if $g_debug > 1 or $code eq 'CORE';
 }
 
 #
@@ -726,3 +722,5 @@ sub tracker_shutdown
   &print_event('CORE', 'Завершение работы трекера...');
   exit(0);
 }
+
+1;

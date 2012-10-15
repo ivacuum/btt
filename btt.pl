@@ -1,7 +1,7 @@
 #!/usr/bin/perl -T
 #
 # @package bt.ivacuum.ru
-# @copyright (c) 2011 vacuum
+# @copyright (c) 2012 vacuum
 #
 use strict;
 no strict 'vars';
@@ -11,9 +11,9 @@ use DBI ();
 use Digest::SHA1 qw(sha1_hex);
 use EV;
 use IO::Socket::INET qw(IPPROTO_TCP TCP_NODELAY SO_LINGER SO_REUSEADDR SOL_SOCKET);
-use JSON qw(encode_json);
+use JSON qw(encode_json to_json);
 
-do './functions.plib';
+require './functions.plib';
 
 # Отключение буферизации
 $| = 1;
@@ -86,7 +86,8 @@ my $sigterm = EV::signal 'TERM', sub {
 };
 
 # Загрузка торрентов
-eval {
+{
+  my $start_time = EV::time;
   my $sql = '
       SELECT
           info_hash,
@@ -102,31 +103,32 @@ eval {
           bb_bt_torrents';
   my $result = &sql_query($sql);
 
-  while( my $row = $result->fetchrow_hashref ) {
-    $g_files{$row->{'info_hash'}} = {
-      'complete_count'   => int($row->{'complete_count'}),
+  while( my($info_hash, $poster_id, $topic_id, $complete_count, $speed_down, $speed_up, $reg_time, $seeder_last_seen, $last_dl_time) = $result->fetchrow_array ) {
+    $g_files{$info_hash} = {
+      'complete_count'   => int($complete_count),
       'dirty'            => 0,
-      'last_dl_time'     => int($row->{'last_dl_time'}),
+      'last_dl_time'     => int($last_dl_time),
       'leechers'         => 0,
       'peers'            => {},
-      'poster_id'        => int($row->{'poster_id'}),
-      'reg_time'         => int($row->{'reg_time'}),
-      'seeder_last_seen' => int($row->{'seeder_last_seen'}),
+      'poster_id'        => int($poster_id),
+      'reg_time'         => int($reg_time),
+      'seeder_last_seen' => int($seeder_last_seen),
       'seeders'          => 0,
       'speed_down'       => 0,
       'speed_up'         => 0,
-      'topic_id'         => int($row->{'topic_id'})
+      'topic_id'         => int($topic_id)
     };
-
-    $g_topics{$row->{'topic_id'}} = $row->{'info_hash'};
+    
+    $g_topics{$topic_id} = $info_hash;
   }
-};
-
-&print_event('CORE', 'Торрент-файлы загружены (' . &num_format(scalar(keys(%g_files))) . ')');
+  
+  &print_event('CORE', sprintf('Торрент-файлы загружены (%s) за %.4f с', &num_format(scalar keys %g_files), EV::time - $start_time));
+}
 
 # Загрузка пользователей
 # TODO: limit
-eval {
+{
+  my $start_time = EV::time;
   my $sql = '
       SELECT
           user_id,
@@ -137,10 +139,10 @@ eval {
           bb_bt_users';
   my $result = &sql_query($sql);
 
-  while( my $row = $result->fetchrow_hashref ) {
-    $g_users{$row->{'auth_key'}} = {
+  while( my($user_id, $auth_key, $user_agent, $can_leech) = $result->fetchrow_array ) {
+    $g_users{$auth_key} = {
       'bonus'      => 0,
-      'can_leech'  => int($row->{'can_leech'}),
+      'can_leech'  => int($can_leech),
       'dirty'      => 0,
       'downloaded' => 0,
       'leeching'   => 0,
@@ -151,18 +153,19 @@ eval {
       'speed_up'   => 0,
       'timebonus'  => 0,
       'uploaded'   => 0,
-      'user_agent' => $row->{'user_agent'},
-      'user_id'    => int($row->{'user_id'})
+      'user_agent' => $user_agent,
+      'user_id'    => int($user_id)
     };
-
-    $g_uids{$row->{'user_id'}} = $row->{'auth_key'};
+  
+    $g_uids{$user_id} = $auth_key;
   }
-};
 
-&print_event('CORE', 'Загружены данные пользователей (' . &num_format(scalar(keys(%g_users))) . ')');
+  &print_event('CORE', sprintf('Загружены данные пользователей (%s) за %.4f с', &num_format(scalar keys %g_users), EV::time - $start_time));
+}
 
 # Загрузка пиров
-eval {
+{
+  my $start_time = EV::time;
   my $sql = '
       SELECT
           peer_hash,
@@ -182,28 +185,28 @@ eval {
           bb_bt_tracker';
   my $result = &sql_query($sql);
 
-  while( my $row = $result->fetchrow_hashref ) {
-    $g_peers{$row->{'peer_hash'}} = {
-      'downloaded' => int($row->{'downloaded'}),
-      'mtime'      => int($row->{'update_time'}),
-      'seeder'     => int($row->{'seeder'}),
-      'seeding'    => int($row->{'seeding'}),
-      'speed_down' => int($row->{'speed_down'}),
-      'speed_up'   => int($row->{'speed_up'}),
-      'stime'      => int($row->{'connect_time'}),
-      'uploaded'   => int($row->{'uploaded'}),
-      'user_id'    => int($row->{'user_id'})
+  while( my($peer_hash, $topic_id, $user_id, $ip, $port, $seeder, $uploaded, $downloaded, $speed_up, $speed_down, $seeding, $connect_time, $update_time) = $result->fetchrow_array ) {
+    $g_peers{$peer_hash} = {
+      'downloaded' => int($downloaded),
+      'mtime'      => int($update_time),
+      'seeder'     => int($seeder),
+      'seeding'    => int($seeding),
+      'speed_down' => int($speed_down),
+      'speed_up'   => int($speed_up),
+      'stime'      => int($connect_time),
+      'uploaded'   => int($uploaded),
+      'user_id'    => int($user_id)
     };
-
+    
     # Наполняем раздачи пирами из БД
-    if( defined $g_topics{$row->{'topic_id'}} ) {
-      my $auth_key  = $g_uids{$row->{'user_id'}};
-      my $info_hash = $g_topics{$row->{'topic_id'}};
+    if( defined $g_topics{$topic_id} ) {
+      my $auth_key  = $g_uids{$user_id};
+      my $info_hash = $g_topics{$topic_id};
 
       if( defined $g_files{$info_hash} ) {
-        $g_files{$info_hash}{'peers'}{$row->{'peer_hash'}} = pack('Nn', &ip2long($row->{'ip'}), int($row->{'port'}));
+        $g_files{$info_hash}{'peers'}{$peer_hash} = pack('Nn', &ip2long($ip), int($port));
 
-        if( int($row->{'seeder'}) ) {
+        if( int($seeder) ) {
           $g_files{$info_hash}{'seeders'}++;
           $g_users{$auth_key}{'seeding'}++;
         } else {
@@ -213,17 +216,17 @@ eval {
 
         $g_files{$info_hash}{'dirty'} = 1;
         $g_users{$auth_key}{'dirty'} = 1;
-        $g_files{$info_hash}{'speed_down'} += $row->{'speed_down'};
-        $g_files{$info_hash}{'speed_up'} += $row->{'speed_up'};
+        $g_files{$info_hash}{'speed_down'} += $speed_down;
+        $g_files{$info_hash}{'speed_up'} += $speed_up;
       }
     }
   }
-};
+  
+  &print_event('CORE', sprintf('Загружены данные пиров (%s) за %.4f с', &num_format(scalar keys %g_peers), EV::time - $start_time));
+}
 
 undef %g_topics;
 undef %g_uids;
-
-&print_event('CORE', 'Загружены данные пиров (' . &num_format(scalar(keys(%g_peers))) . ')');
 
 # Подключение к memcached
 my $memcache = new Cache::Memcached::Fast({
@@ -251,27 +254,27 @@ $memcache->set($g_cache_prefix . 'status', encode_json({
 
 # Создание сокета
 my $fh = IO::Socket::INET->new(
-  Proto     => 'tcp',
-  LocalAddr => $s_ip,
-  LocalPort => $s_port,
-  Listen    => 50000,
-  ReuseAddr => SO_REUSEADDR,
-  Blocking  => 0
+  'Proto'     => 'tcp',
+  'LocalAddr' => $s_ip,
+  'LocalPort' => $s_port,
+  'Listen'    => 50000,
+  'ReuseAddr' => SO_REUSEADDR,
+  'Blocking'  => 0
 ) or die("\nНевозможно создать сокет: $!\n");
-setsockopt($fh, IPPROTO_TCP, TCP_NODELAY, 1);
-setsockopt($fh, SOL_SOCKET, SO_LINGER, pack('II', 1, 0));
+setsockopt $fh, IPPROTO_TCP, TCP_NODELAY, 1;
+setsockopt $fh, SOL_SOCKET, SO_LINGER, pack('II', 1, 0);
 &print_event('CORE', 'Принимаем входящие пакеты по адресу ' . $s_ip . ':' . $s_port);
 
-&print_event('RAM', 'files: ' . num_format(total_size(\%g_files)));
-&print_event('RAM', 'peers: ' . num_format(total_size(\%g_peers)));
-&print_event('RAM', 'users: ' . num_format(total_size(\%g_users)));
+&print_event('RAM', 'files: ' . &num_format(total_size(\%g_files)));
+&print_event('RAM', 'peers: ' . &num_format(total_size(\%g_peers)));
+&print_event('RAM', 'users: ' . &num_format(total_size(\%g_users)));
 
 # Принимаем подключения
 my $event = EV::io $fh, EV::READ, sub {
   my $session = $fh->accept() or return 0;
 
   # Клиент закрыл соединение
-  return &close_connection($session) if(!$session->peerhost);
+  return &close_connection($session) if !$session->peerhost;
 
   # Неблокирующий режим работы
   $session->blocking(0);
@@ -311,10 +314,7 @@ my $event = EV::io $fh, EV::READ, sub {
     }
 
     $g_accepted++;
-
-    if( $g_accepted % 10000 == 0 ) {
-      &print_event('CORE', 'Подключений: ' . $g_accepted);
-    }
+    &print_event('CORE', 'Подключений: ' . $g_accepted) if $g_accepted % 10000 == 0;
 
     $ev_unixtime = int(EV::now);
 
@@ -337,7 +337,7 @@ my $event = EV::io $fh, EV::READ, sub {
       my $numwant = $hash{'numwant'} || 0;
       my $peer_id = $hash{'peer_id'};
       my $port = $hash{'port'} || 0;
-      my $seeder = ( $left == 0 ) ? 1 : 0;
+      my $seeder = $left == 0 ? 1 : 0;
       my $uploaded = $hash{'uploaded'};
       my $user_agent;
 
@@ -347,38 +347,26 @@ my $event = EV::io $fh, EV::READ, sub {
       } else {
         # Если клиент не передал свое название,
         # то берем сокращенное из peer_id
-        $user_agent = substr($peer_id, 1, 6);
+        $user_agent = substr $peer_id, 1, 6;
       }
 
       # &print_event('RECV', 'Подключился ' . $session->peerhost . ':' . $port . ' ' . $user_agent);
 
       # Проверка поступивших данных
-      if( substr($session->peerhost, 0, 3) ne '10.' ) {
-        return &btt_msg_die($session, 'Трекер доступен только для абонентов Билайн-Калуга');
-      } elsif( !$auth_key or length($auth_key) != $g_auth_key_length ) {
-        return &btt_msg_die($session, 'Ключ не найден - авторизуйтесь и скачайте торрент-файл заново');
-      } elsif( !$info_hash or length($info_hash) != 20 ) {
-        return &btt_msg_die($session, 'Неверный info_hash торрента');
-      } elsif( !$peer_id or length($peer_id) != 20 ) {
-        return &btt_msg_die($session, 'Неверный peer_id клиента');
-      } elsif( $port <= 0 or $port > 65535 ) {
-        return &btt_msg_die($session, 'Неверный порт');
-      } elsif( $downloaded < 0 ) {
-        return &btt_msg_die($session, 'Неверное значение downloaded');
-      } elsif( $uploaded < 0 ) {
-        return &btt_msg_die($session, 'Неверное значение uploaded');
-      } elsif( $left < 0 ) {
-        return &btt_msg_die($session, 'Неверное значение left');
-      } elsif( !($auth_key =~ /^[a-zA-Z\d]{$g_auth_key_length}$/) ) {
-        return &btt_msg_die($session, 'Неверный ключ авторизации');
-      } elsif( $compact != 1 ) {
-        &print_event('CORE', 'Клиент ' . $user_agent . ' не поддерживает упакованные ответы');
-        return &btt_msg_die($session, 'Ваш клиент не поддерживает упакованные ответы');
-      } elsif( !defined $g_files{$info_hash} or !defined $g_files{$info_hash}{'poster_id'} ) {
-        return &btt_msg_die($session, 'Торрент не зарегистрирован');
-      } elsif( !defined $g_users{$auth_key} ) {
-        return &btt_msg_die($session, 'Пользователь не найден - авторизуйтесь и скачайте торрент-файл заново');
-      } elsif( $g_users{$auth_key}{'can_leech'} == 0 ) {
+      return &btt_msg_die($session, 'Трекер доступен только для абонентов Билайн-Калуга') if substr($session->peerhost, 0, 3) ne '10.';
+      return &btt_msg_die($session, 'Ключ не найден - авторизуйтесь и скачайте торрент-файл заново') if !$auth_key or length($auth_key) != $g_auth_key_length;
+      return &btt_msg_die($session, 'Неверный info_hash торрента') if !$info_hash or length($info_hash) != 20;
+      return &btt_msg_die($session, 'Неверный peer_id клиента') if !$peer_id or length($peer_id) != 20;
+      return &btt_msg_die($session, 'Неверный порт') if $port <= 0 or $port > 65535;
+      return &btt_msg_die($session, 'Неверное значение downloaded') if $downloaded < 0;
+      return &btt_msg_die($session, 'Неверное значение uploaded') if $uploaded < 0;
+      return &btt_msg_die($session, 'Неверное значение left') if $left < 0;
+      return &btt_msg_die($session, 'Неверный ключ авторизации') if !($auth_key =~ /^[a-zA-Z\d]{$g_auth_key_length}$/);
+      return &btt_msg_die($session, 'Ваш клиент не поддерживает упакованные ответы') if $compact != 1;
+      return &btt_msg_die($session, 'Торрент не зарегистрирован') if !defined $g_files{$info_hash} or !defined $g_files{$info_hash}{'poster_id'};
+      return &btt_msg_die($session, 'Пользователь не найден - авторизуйтесь и скачайте торрент-файл заново') if !defined $g_users{$auth_key};
+      
+      if( $g_users{$auth_key}{'can_leech'} == 0 ) {
         # Пользователю запрещено скачивать чужие релизы. Можно только раздавать свои
         if( $g_users{$auth_key}{'user_id'} != $g_files{$info_hash}{'poster_id'} ) {
           return &btt_msg_die($session, 'Вы не можете качать торренты');
@@ -437,9 +425,9 @@ my $event = EV::io $fh, EV::READ, sub {
       # -1 = релизер
       #  0 = качает
       #  1 = скачал
-      my $dlstatus = ( $left ) ? 0 : 1;
-      my $releaser = ( $g_users{$auth_key}{'user_id'} == $g_files{$info_hash}{'poster_id'} ) ? 1 : 0;
-      $dlstatus = -1 if($releaser);
+      my $dlstatus = $left ? 0 : 1;
+      my $releaser = $g_users{$auth_key}{'user_id'} == $g_files{$info_hash}{'poster_id'} ? 1 : 0;
+      $dlstatus = -1 if $releaser;
 
       $g_dlstatus_buffer = sprintf('%s%s(%d, %d, %d)', $g_dlstatus_buffer, (($g_dlstatus_buffer) ? ', ' : ''), $g_files{$info_hash}{'topic_id'}, $g_users{$auth_key}{'user_id'}, $dlstatus);
 
@@ -490,7 +478,7 @@ my $event = EV::io $fh, EV::READ, sub {
         }
 
         # Время сидирования (для зачисления таймбонусов)
-        $g_peers{$peer_hash}{'seeding'} += $ev_unixtime - $g_peers{$peer_hash}{'mtime'} if($seeder);
+        $g_peers{$peer_hash}{'seeding'} += $ev_unixtime - $g_peers{$peer_hash}{'mtime'} if $seeder;
 
         $speed_down_prev = $g_peers{$peer_hash}{'speed_down'};
         $speed_up_prev   = $g_peers{$peer_hash}{'speed_up'};
@@ -506,10 +494,10 @@ my $event = EV::io $fh, EV::READ, sub {
 
       # Учет скачанного и отданного
       if( $down_add or $up_add ) {
-        $g_users{$auth_key}{'bonus'} += $up_add if($seeder and !$releaser and $g_files{$info_hash}{'seeders'} == 1 and $g_peers{$peer_hash}{'seeder'} == 1);
+        $g_users{$auth_key}{'bonus'} += $up_add if $seeder and !$releaser and $g_files{$info_hash}{'seeders'} == 1 and $g_peers{$peer_hash}{'seeder'} == 1;
         $g_users{$auth_key}{'dirty'} = 1;
         $g_users{$auth_key}{'downloaded'} += $down_add;
-        $g_users{$auth_key}{'released'} += $up_add if($releaser);
+        $g_users{$auth_key}{'released'} += $up_add if $releaser;
         $g_users{$auth_key}{'uploaded'} += $up_add;
       }
 
@@ -534,8 +522,8 @@ my $event = EV::io $fh, EV::READ, sub {
       # Используемый клиент
       $g_users{$auth_key}{'user_agent'} = $user_agent;
 
-      $numwant = $g_max_numwant if($numwant > $g_max_numwant);
-      $numwant = $g_min_numwant if($numwant < $g_min_numwant);
+      $numwant = $g_max_numwant if $numwant > $g_max_numwant;
+      $numwant = $g_min_numwant if $numwant < $g_min_numwant;
 
       if( $event eq 'stopped' ) {
         # Удаление пира
@@ -572,35 +560,33 @@ my $event = EV::io $fh, EV::READ, sub {
 
       # Создание списка пиров для клиента
       foreach my $key (keys %{$g_files{$info_hash}{'peers'}}) {
-        next if($key eq $peer_hash);
-        next if($seeder and $g_peers{$key}{'seeder'} and $key ne $peer_hash);
+        next if $key eq $peer_hash;
+        next if $seeder and $g_peers{$key}{'seeder'} and $key ne $peer_hash;
         $peers .= $g_files{$info_hash}{'peers'}{$key};
-        last if(++$peers_count == $numwant);
+        last if ++$peers_count == $numwant;
       }
 
       # Увеличиваем время анонса пропорционально количеству раздач в клиенте
       my $requests = int(($g_users{$auth_key}{'seeding'} + $g_users{$auth_key}{'leeching'}) * 1.25);
       
-      if( $requests + 60 > $g_expiration_time ) {
-        # Чтобы обладатели большого количества раздач не были
-        # раньше времени удалены как отключившиеся пиры
-        $g_expiration_time = $requests + 60;
-      }
+      # Чтобы обладатели большого количества раздач не были
+      # раньше времени удалены как отключившиеся пиры
+      $g_expiration_time = $requests + 60 if $requests + 60 > $g_expiration_time;
 
       # Анонс
       return &btt_msg($session, {
         'complete'   => $g_files{$info_hash}{'seeders'},
         'incomplete' => $g_files{$info_hash}{'leechers'},
         'downloaded' => $g_files{$info_hash}{'complete_count'},
-        'interval'   => ($requests > $g_announce_interval) ? $requests : $g_announce_interval,
+        'interval'   => $requests > $g_announce_interval ? $requests : $g_announce_interval,
         'peers'      => $peers
       });
-      } elsif( $g_debug > 1 and $s_output =~ /^GET \/dumper HTTP/ ) {
+    } elsif( $g_debug > 1 and $s_output =~ /^GET \/dumper HTTP/ ) {
         # Дамп данных
-        return &html_msg($session, 'Дамп данных', '<h3>g_files [' . scalar(keys(%g_files)) . ']</h3><pre>' . Dumper(%g_files) . '</pre><h3>g_peers [' . scalar(keys(%g_peers)) . ']</h3><pre>' . Dumper(%g_peers) . '</pre><h3>g_users [' . scalar(keys(%g_users)) . ']</h3><pre>' . Dumper(%g_peers) . '</pre>');
+        return &html_msg($session, 'Дамп данных', '<h3>g_files [' . (scalar keys %g_files) . ']</h3><pre>' . to_json(\%g_files, { pretty => 1 }) . '</pre><h3>g_peers [' . (scalar keys %g_peers) . ']</h3><pre>' . to_json(\%g_peers, { pretty => 1 }) . '</pre><h3>g_users [' . (scalar keys %g_users) . ']</h3><pre>' . to_json(\%g_users, { pretty => 1 }) . '</pre>');
     } elsif( $s_output =~ /^GET \/stats HTTP/ ) {
       # Запрос статистики
-      return &html_msg($session, 'Статистика трекера', sprintf('<h3>Статистика трекера</h3><p>Трекер работает %s, обслуживает %s пиров на %s раздачах.</p><p>Подключений обслужено: %s. Отклонено по таймауту (%d сек): %.5f%% (%s).</p><p>Скачано торрентов через трекер: %s.</p>', &date_format($ev_unixtime - $g_starttime), &num_format(scalar(keys(%g_peers))), &num_format(scalar(keys(%g_files))), &num_format($g_accepted), $g_accept_interval, $g_rejected / ($g_accepted - $g_rejected), &num_format($g_rejected), &num_format($g_complete_count)));
+      return &html_msg($session, 'Статистика трекера', sprintf('<h3>Статистика трекера</h3><p>Трекер работает %s, обслуживает %s пиров на %s раздачах.</p><p>Подключений обслужено: %s. Отклонено по таймауту (%d сек): %.5f%% (%s).</p><p>Скачано торрентов через трекер: %s.</p>', &date_format($ev_unixtime - $g_starttime), &num_format(scalar keys %g_peers), &num_format(scalar keys %g_files), &num_format($g_accepted), $g_accept_interval, $g_rejected / ($g_accepted - $g_rejected), &num_format($g_rejected), &num_format($g_complete_count)));
     } elsif( $s_output =~ /^GET \/ping HTTP/ or $s_output =~ /^GET \%2Fping HTTP/ ) {
       # Проверка отклика
       return &html_msg_simple($session, "I'm alive! Don't worry.");
@@ -610,7 +596,7 @@ my $event = EV::io $fh, EV::READ, sub {
     }
   };
 
-  EV::once($session, EV::READ, $g_accept_interval, $callback);
+  EV::once $session, EV::READ, $g_accept_interval, $callback;
 };
 
 ##
@@ -619,9 +605,7 @@ my $event = EV::io $fh, EV::READ, sub {
 my $cron_exec = 1;
 
 my $cron = EV::timer $g_cron_interval, $g_cron_interval, sub {
-  if( $0 =~ /_dev/ ) {
-    return;
-  }
+  return if $0 =~ /_dev/;
 
   $ev_unixtime = int(EV::now);
 
@@ -629,9 +613,7 @@ my $cron = EV::timer $g_cron_interval, $g_cron_interval, sub {
   # Запись информации о состоянии закачек
   # Интервал: 1 минута (4 * $g_cron_interval)
   #
-  if( $cron_exec % 4 == 0 ) {
-    &cron_dlstatus_write();
-  }
+  &cron_dlstatus_write() if $cron_exec % 4 == 0;
 
   # Удаленные торрент-файлы
   &cron_torrents_deleted();
@@ -643,33 +625,25 @@ my $cron = EV::timer $g_cron_interval, $g_cron_interval, sub {
   # Запись информации о торрент-файлах в БД
   # Интервал: 1 минута (4 * $g_cron_interval)
   #
-  if( $cron_exec % 4 == 0 ) {
-    &cron_files_write();
-  }
+  &cron_files_write() if $cron_exec % 4 == 0;
 
   #
   # Чтение информации о новых пользователях из БД
   # Интервал: 30 секунд (2 * $g_cron_interval)
   #
-  if( $cron_exec % 2 == 0 ) {
-    &cron_users_read();
-  }
+  &cron_users_read() if $cron_exec % 2 == 0;
 
   #
   # Запись информации о пользователях в БД
   # Интервал: 1 минута
   #
-  if( $cron_exec % 4 == 0 ) {
-    &cron_users_write();
-  }
+  &cron_users_write() if $cron_exec % 4 == 0;
 
   #
   # Удаление информации об отключившихся пирах
   # Интервал: 5 минут
   #
-  if( $cron_exec % 20 == 0 ) {
-    &cron_peers_purge();
-  }
+  &cron_peers_purge() if $cron_exec % 20 == 0;
 
   #
   # Запись состояния ретрекера в memcache
@@ -679,9 +653,9 @@ my $cron = EV::timer $g_cron_interval, $g_cron_interval, sub {
     $memcache->replace($g_cache_prefix . 'status', encode_json({
       'accepted'  => $g_accepted,
       'completed' => $g_complete_count,
-      'files'     => scalar(keys(%g_files)),
+      'files'     => scalar keys %g_files,
       'rejected'  => $g_rejected,
-      'peers'     => scalar(keys(%g_peers)),
+      'peers'     => scalar keys %g_peers,
       'uptime'    => $ev_unixtime - $g_starttime
     }), $g_cache_expire);
   }
@@ -691,11 +665,9 @@ my $cron = EV::timer $g_cron_interval, $g_cron_interval, sub {
   # и количества раздаваемых и скачиваемых торрентов пользователями
   # Интервал: 3 часа
   #
-  if( $cron_exec % 720 == 0 ) {
-    &cron_peers_sync();
-  }
+  &cron_peers_sync() if $cron_exec % 720 == 0;
 
-  $cron_exec = 0 if($cron_exec % 720 == 0);
+  $cron_exec = 0 if $cron_exec % 720 == 0;
   $cron_exec++;
 };
 
